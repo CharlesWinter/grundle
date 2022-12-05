@@ -1,208 +1,210 @@
 package main
 
 import (
-	"context"
 	"fmt"
-	"io"
-	"net/http"
+	"math/rand"
 	"os"
-	"strings"
+	"time"
 
+	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/google/go-github/github"
+	"github.com/charmbracelet/lipgloss"
 )
 
-type model struct {
-	choices  []string         // items on the to-do list
-	cursor   int              // which to-do list item our cursor is pointing at
-	selected map[int]struct{} // which to-do items are selected
+var (
+	appStyle = lipgloss.NewStyle().Padding(1, 2)
+
+	titleStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFDF5")).
+			Background(lipgloss.Color("#25A065")).
+			Padding(0, 1)
+
+	statusMessageStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.AdaptiveColor{Light: "#04B575", Dark: "#04B575"}).
+				Render
+)
+
+type item struct {
+	title       string
+	description string
 }
 
-func initialModel() model {
-	return model{
-		// Our to-do list is a grocery list
-		choices: []string{"Add New Package", "Update Existing Package", "Remove Old Package"},
+func (i item) Title() string       { return i.title }
+func (i item) Description() string { return i.description }
+func (i item) FilterValue() string { return i.title }
 
-		// A map which indicates which choices are selected. We're using
-		// the  map like a mathematical set. The keys refer to the indexes
-		// of the `choices` slice, above.
-		selected: make(map[int]struct{}),
+type listKeyMap struct {
+	toggleSpinner    key.Binding
+	toggleTitleBar   key.Binding
+	toggleStatusBar  key.Binding
+	togglePagination key.Binding
+	toggleHelpMenu   key.Binding
+	selectPackage    key.Binding
+	upgradePackage   key.Binding
+	backButton       key.Binding
+}
+
+func newListKeyMap() *listKeyMap {
+	return &listKeyMap{
+		upgradePackage: key.NewBinding(
+			key.WithKeys("a"),
+			key.WithHelp("a", "add item"),
+		),
+		toggleSpinner: key.NewBinding(
+			key.WithKeys("s"),
+			key.WithHelp("s", "toggle spinner"),
+		),
+		toggleTitleBar: key.NewBinding(
+			key.WithKeys("T"),
+			key.WithHelp("T", "toggle title"),
+		),
+		toggleStatusBar: key.NewBinding(
+			key.WithKeys("S"),
+			key.WithHelp("S", "toggle status"),
+		),
+		togglePagination: key.NewBinding(
+			key.WithKeys("P"),
+			key.WithHelp("P", "toggle pagination"),
+		),
+		selectPackage: key.NewBinding(
+			key.WithKeys("enter"),
+			key.WithHelp("enter", "select package"),
+		),
+		backButton: key.NewBinding(
+			key.WithKeys("backspace"),
+			key.WithHelp("backspace", "go back to main menu"),
+		),
+		toggleHelpMenu: key.NewBinding(
+			key.WithKeys("H"),
+			key.WithHelp("H", "toggle help"),
+		),
+	}
+}
+
+type model struct {
+	list            list.Model
+	itemGenerator   *randomItemGenerator
+	keys            *listKeyMap
+	delegateKeys    *delegateKeyMap
+	selectedPackage Package
+}
+
+func newModel() model {
+	pr, _ := newPackageRepo()
+	knownPackages, _ := pr.ListKnownPackages()
+	var (
+		delegateKeys = newDelegateKeyMap()
+		listKeys     = newListKeyMap()
+	)
+
+	// Make initial list of items
+	items := make([]list.Item, len(knownPackages))
+	for i, p := range knownPackages {
+		items[i] = p
+	}
+
+	// Setup list
+	delegate := newItemDelegate(delegateKeys)
+	packageList := list.New(items, delegate, 0, 0)
+	packageList.Title = "Packages"
+	packageList.Styles.Title = titleStyle
+	packageList.AdditionalFullHelpKeys = func() []key.Binding {
+		return []key.Binding{
+			listKeys.toggleSpinner,
+			listKeys.upgradePackage,
+			listKeys.toggleTitleBar,
+			listKeys.toggleStatusBar,
+			listKeys.togglePagination,
+			listKeys.toggleHelpMenu,
+		}
+	}
+
+	return model{
+		list:         packageList,
+		keys:         listKeys,
+		delegateKeys: delegateKeys,
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	// Just return `nil`, which means "no I/O right now, please."
-	return nil
+	return tea.EnterAltScreen
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmds []tea.Cmd
+
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		h, v := appStyle.GetFrameSize()
+		m.list.SetSize(msg.Width-h, msg.Height-v)
 
-	// Is it a key press?
 	case tea.KeyMsg:
+		// Don't match any of the keys below if we're actively filtering.
+		if m.list.FilterState() == list.Filtering {
+			break
+		}
 
-		// Cool, what was the actual key pressed?
-		switch msg.String() {
+		switch {
+		case key.Matches(msg, m.keys.toggleSpinner):
+			cmd := m.list.ToggleSpinner()
+			return m, cmd
 
-		// These keys should exit the program.
-		case "ctrl+c", "q":
-			return m, tea.Quit
+		case key.Matches(msg, m.keys.toggleTitleBar):
+			v := !m.list.ShowTitle()
+			m.list.SetShowTitle(v)
+			m.list.SetShowFilter(v)
+			m.list.SetFilteringEnabled(v)
+			return m, nil
 
-		// The "up" and "k" keys move the cursor up
-		case "up", "k":
-			if m.cursor > 0 {
-				m.cursor--
+		case key.Matches(msg, m.keys.toggleStatusBar):
+			m.list.SetShowStatusBar(!m.list.ShowStatusBar())
+			return m, nil
+
+		case key.Matches(msg, m.keys.togglePagination):
+			m.list.SetShowPagination(!m.list.ShowPagination())
+			return m, nil
+
+		case key.Matches(msg, m.keys.toggleHelpMenu):
+			m.list.SetShowHelp(!m.list.ShowHelp())
+			return m, nil
+
+		case key.Matches(msg, m.keys.backButton):
+			if m.selectedPackage != (Package{}) {
+				m.selectedPackage = Package{}
 			}
 
-		// The "down" and "j" keys move the cursor down
-		case "down", "j":
-			if m.cursor < len(m.choices)-1 {
-				m.cursor++
+		case key.Matches(msg, m.keys.selectPackage):
+			m.delegateKeys.remove.SetEnabled(true)
+			p, ok := m.list.SelectedItem().(Package)
+			if !ok {
+				panic("package not in list!")
 			}
-
-		// The "enter" key and the spacebar (a literal space) toggle
-		// the selected state for the item that the cursor is pointing at.
-		case "enter", " ":
-			_, ok := m.selected[m.cursor]
-			if ok {
-				delete(m.selected, m.cursor)
-			} else {
-				m.selected[m.cursor] = struct{}{}
-			}
+			m.selectedPackage = p
 		}
 	}
 
-	// Return the updated model to the Bubble Tea runtime for processing.
-	// Note that we're not returning a command.
-	return m, nil
+	// This will also call our delegate's update function.
+	newListModel, cmd := m.list.Update(msg)
+	m.list = newListModel
+	cmds = append(cmds, cmd)
+
+	return m, tea.Batch(cmds...)
 }
 
 func (m model) View() string {
-	// The header
-	s := "What would you like to do?\n\n"
-
-	// Iterate over our choices
-	for i, choice := range m.choices {
-
-		// Is the cursor pointing at this choice?
-		cursor := " " // no cursor
-		if m.cursor == i {
-			cursor = ">" // cursor!
-		}
-
-		// Is this choice selected?
-		checked := " " // not selected
-		if _, ok := m.selected[i]; ok {
-			checked = "x" // selected!
-		}
-
-		// Render the row
-		s += fmt.Sprintf("%s [%s] %s\n", cursor, checked, choice)
+	if m.selectedPackage == (Package{}) {
+		return appStyle.Render(m.list.View())
 	}
 
-	// The footer
-	s += "\nPress q to quit.\n"
-
-	// Send the UI for rendering
-	return s
+	return appStyle.Render(fmt.Sprintf("you've selected %s", m.selectedPackage.name))
 }
 
 func main() {
-	p := tea.NewProgram(initialModel())
-	if err := p.Start(); err != nil {
-		fmt.Printf("Alas, there's been an error: %v", err)
+	rand.Seed(time.Now().UTC().UnixNano())
+
+	if err := tea.NewProgram(newModel()).Start(); err != nil {
+		fmt.Println("Error running program:", err)
 		os.Exit(1)
 	}
-
-	client := github.NewClient(nil)
-
-	repoName := "helix"
-
-	opt := &github.ListOptions{Page: 1, PerPage: 2}
-	releases, _, err := client.Repositories.ListReleases(context.Background(), "helix-editor", repoName, opt)
-
-	if err != nil {
-		fmt.Println(err)
-	}
-
-	targetRelease := releases[1]
-
-	if targetRelease == nil {
-		panic("cannot get latest release")
-	}
-
-	var tagName = targetRelease.GetTagName()
-
-	var hasAppImage bool
-	var downloadURL string
-	for _, releaseAsset := range targetRelease.Assets {
-		if strings.HasSuffix(releaseAsset.GetBrowserDownloadURL(), "AppImage") {
-			hasAppImage = true
-			downloadURL = releaseAsset.GetBrowserDownloadURL()
-			fmt.Println("browser download url is", releaseAsset.GetBrowserDownloadURL())
-		}
-	}
-
-	if !hasAppImage {
-		fmt.Println("package has no AppImage. Goodbye!")
-		os.Exit(0)
-	}
-
-	// download the file
-	filePath := fmt.Sprintf("%s/.grundle/packages/%s/%s.%s", os.Getenv("HOME"), repoName, repoName, tagName)
-	fmt.Println("filePath is", filePath)
-	err = downloadFile(filePath, downloadURL)
-	if err != nil {
-		panic(err)
-	}
-
-	// make it (very!) permissive
-	os.Chmod(filePath, 0777)
-
-	binPath := fmt.Sprintf("%s/.grundle/bin/%s", os.Getenv("HOME"), repoName)
-	if err := upsertSymlink(filePath, binPath); err != nil {
-		panic(err)
-	}
-}
-
-func upsertSymlink(src, dst string) error {
-	// sack off the old symlink path
-	if _, err := os.Lstat(dst); err == nil {
-		os.Remove(dst)
-	}
-
-	// symlink it to the binaries folder
-	if err := os.Symlink(src, dst); err != nil {
-		return err
-	}
-	return nil
-}
-
-func downloadFile(filepath string, url string) (err error) {
-	// Create the file
-	out, err := os.Create(filepath)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	// Get the data
-	resp, err := http.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	// Check server response
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("bad status: %s", resp.Status)
-	}
-
-	// Writer the body to file
-	_, err = io.Copy(out, resp.Body)
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
